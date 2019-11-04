@@ -150,9 +150,14 @@ TfLiteStatus MicroInterpreter::AllocateTensors() {
   return kTfLiteOk;
 }
 
-TfLiteStatus MicroInterpreter::Invoke() {
+TfLiteStatus MicroInterpreter::InvokeStart() {
+  if (invokeContext_.state != InvokeContext::IDLE) {
+    error_reporter_->Report("InvokeStart() called and MicroInterpreter not idle \n");
+    return kTfLiteError;
+  }
+
   if (initialization_status_ != kTfLiteOk) {
-    error_reporter_->Report("Invoke() called after initialization failed\n");
+    error_reporter_->Report("InvokeStart() called after initialization failed\n");
     return kTfLiteError;
   }
 
@@ -161,109 +166,164 @@ TfLiteStatus MicroInterpreter::Invoke() {
   if (!tensors_allocated_) {
     AllocateTensors();
   }
+
+  invokeContext_.state = InvokeContext::STARTED;
+  invokeContext_.current_opcode = 0;
+  return kTfLiteOk;
+}
+
+TfLiteStatus MicroInterpreter::InvokeAbort() {
+  if (invokeContext_.state != InvokeContext::STARTED) {
+    error_reporter_->Report("InvokeAbort() called and MicroInterpreter is idle\n");
+    return kTfLiteError;
+  }
+  invokeContext_.state = InvokeContext::IDLE;
+  return kTfLiteOk;
+}
+
+
+TfLiteStatus MicroInterpreter::InvokeStep(bool &done) {
+
+  if (invokeContext_.state != InvokeContext::STARTED) {
+    error_reporter_->Report("InvokeStep() called and MicroInterpreter is idle\n");
+    return kTfLiteError;
+  }
+
+  // Ensure tensors are allocated before the interpreter is invoked to avoid
+  // difficult to debug segfaults.
+  if (!tensors_allocated_) {
+    AllocateTensors();
+  }
+
+  // Any early return is an error
+  done = true;
+  invokeContext_.state = InvokeContext::IDLE;
+
   TfLiteStatus status = kTfLiteOk;
   auto opcodes = model_->operator_codes();
-  for (size_t i = 0; i < operators_->size(); ++i) {
-    const auto* op = operators_->Get(i);
-    size_t index = op->opcode_index();
-    if (index < 0 || index >= opcodes->size()) {
-      error_reporter_->Report("Missing registration for opcode_index %d\n",
-                              index);
+  const auto* op = operators_->Get(invokeContext_.current_opcode);
+  size_t index = op->opcode_index();
+  if (index < 0 || index >= opcodes->size()) {
+    error_reporter_->Report("Missing registration for opcode_index %d\n",
+                            index);
+    return kTfLiteError;
+  }
+
+
+  auto opcode = (*opcodes)[index];
+  const TfLiteRegistration* registration = nullptr;
+  status = GetRegistrationFromOpCode(opcode, op_resolver_, error_reporter_,
+                                     &registration);
+  if (status != kTfLiteOk) {
+    return status;
+  }
+  if (registration == nullptr) {
+    error_reporter_->Report("Skipping op for opcode_index %d\n", index);
+    return kTfLiteError;
+  }
+  BuiltinOperator op_type =
+      static_cast<BuiltinOperator>(registration->builtin_code);
+
+  if (op_type != BuiltinOperator_CUSTOM && op->custom_options()) {
+    error_reporter_->Report(
+        "Unsupported behavior: found builtin operator %s with custom "
+        "options.\n",
+        EnumNameBuiltinOperator(op_type));
+    return kTfLiteError;
+  }
+  StackDataAllocator stack_data_allocator;
+  const char* custom_data = nullptr;
+  size_t custom_data_size = 0;
+  unsigned char* builtin_data = nullptr;
+  if (op->custom_options()) {
+    custom_data = reinterpret_cast<const char*>(op->custom_options()->data());
+    custom_data_size = op->custom_options()->size();
+  } else {
+    TF_LITE_ENSURE_STATUS(ParseOpData(op, op_type, error_reporter_,
+                                      &stack_data_allocator,
+                                      (void**)(&builtin_data)));
+  }
+
+  const char* init_data;
+  size_t init_data_size;
+  if (registration->builtin_code == BuiltinOperator_CUSTOM) {
+    init_data = custom_data;
+    init_data_size = custom_data_size;
+  } else {
+    init_data = reinterpret_cast<const char*>(builtin_data);
+    init_data_size = 0;
+  }
+  void* user_data = nullptr;
+  if (registration->init) {
+    user_data = registration->init(&context_, init_data, init_data_size);
+  }
+
+  // Disregard const qualifier to workaround with existing API.
+  TfLiteIntArray* inputs_array = const_cast<TfLiteIntArray*>(
+      reinterpret_cast<const TfLiteIntArray*>(op->inputs()));
+  TfLiteIntArray* outputs_array = const_cast<TfLiteIntArray*>(
+      reinterpret_cast<const TfLiteIntArray*>(op->outputs()));
+
+  const int kMaxTemporaries = 16;
+  int temporaries_data[kMaxTemporaries + 1];
+  TfLiteIntArray* temporaries_array =
+      reinterpret_cast<TfLiteIntArray*>(temporaries_data);
+  temporaries_array->size = 0;
+
+  TfLiteNode node;
+  node.inputs = inputs_array;
+  node.outputs = outputs_array;
+  node.temporaries = temporaries_array;
+  node.user_data = user_data;
+  node.builtin_data = reinterpret_cast<void*>(builtin_data);
+  node.custom_initial_data = custom_data;
+  node.custom_initial_data_size = custom_data_size;
+  node.delegate = nullptr;
+  if (registration->prepare) {
+    TfLiteStatus prepare_status = registration->prepare(&context_, &node);
+    if (prepare_status != kTfLiteOk) {
+      error_reporter_->Report(
+          "Node %s (number %d) failed to prepare with status %d",
+          OpNameFromRegistration(registration), invokeContext_.current_opcode, prepare_status);
       return kTfLiteError;
     }
-    auto opcode = (*opcodes)[index];
-    const TfLiteRegistration* registration = nullptr;
-    status = GetRegistrationFromOpCode(opcode, op_resolver_, error_reporter_,
-                                       &registration);
+  }
+
+  if (registration->invoke) {
+    TfLiteStatus invoke_status = registration->invoke(&context_, &node);
+    if (invoke_status != kTfLiteOk) {
+      error_reporter_->Report(
+          "Node %s (number %d) failed to invoke with status %d",
+          OpNameFromRegistration(registration), invokeContext_.current_opcode, invoke_status);
+      return kTfLiteError;
+    }
+  }
+
+  if (registration->free) {
+    registration->free(&context_, user_data);
+  }
+
+  // Increment
+  invokeContext_.current_opcode++;
+  if (status == kTfLiteOk && invokeContext_.current_opcode < operators_->size()) {
+    invokeContext_.state  =  InvokeContext::STARTED;
+    done = false;
+  }
+  return status;
+}
+
+TfLiteStatus  MicroInterpreter::Invoke() {
+  TfLiteStatus status = InvokeStart();
+  if (status != kTfLiteOk) {
+    return status;
+  }
+  bool done;
+  do {
+    status = InvokeStep(done);
     if (status != kTfLiteOk) {
       return status;
     }
-    if (registration == nullptr) {
-      error_reporter_->Report("Skipping op for opcode_index %d\n", index);
-      return kTfLiteError;
-    }
-    BuiltinOperator op_type =
-        static_cast<BuiltinOperator>(registration->builtin_code);
-
-    if (op_type != BuiltinOperator_CUSTOM && op->custom_options()) {
-      error_reporter_->Report(
-          "Unsupported behavior: found builtin operator %s with custom "
-          "options.\n",
-          EnumNameBuiltinOperator(op_type));
-      return kTfLiteError;
-    }
-    StackDataAllocator stack_data_allocator;
-    const char* custom_data = nullptr;
-    size_t custom_data_size = 0;
-    unsigned char* builtin_data = nullptr;
-    if (op->custom_options()) {
-      custom_data = reinterpret_cast<const char*>(op->custom_options()->data());
-      custom_data_size = op->custom_options()->size();
-    } else {
-      TF_LITE_ENSURE_STATUS(ParseOpData(op, op_type, error_reporter_,
-                                        &stack_data_allocator,
-                                        (void**)(&builtin_data)));
-    }
-
-    const char* init_data;
-    size_t init_data_size;
-    if (registration->builtin_code == BuiltinOperator_CUSTOM) {
-      init_data = custom_data;
-      init_data_size = custom_data_size;
-    } else {
-      init_data = reinterpret_cast<const char*>(builtin_data);
-      init_data_size = 0;
-    }
-    void* user_data = nullptr;
-    if (registration->init) {
-      user_data = registration->init(&context_, init_data, init_data_size);
-    }
-
-    // Disregard const qualifier to workaround with existing API.
-    TfLiteIntArray* inputs_array = const_cast<TfLiteIntArray*>(
-        reinterpret_cast<const TfLiteIntArray*>(op->inputs()));
-    TfLiteIntArray* outputs_array = const_cast<TfLiteIntArray*>(
-        reinterpret_cast<const TfLiteIntArray*>(op->outputs()));
-
-    const int kMaxTemporaries = 16;
-    int temporaries_data[kMaxTemporaries + 1];
-    TfLiteIntArray* temporaries_array =
-        reinterpret_cast<TfLiteIntArray*>(temporaries_data);
-    temporaries_array->size = 0;
-
-    TfLiteNode node;
-    node.inputs = inputs_array;
-    node.outputs = outputs_array;
-    node.temporaries = temporaries_array;
-    node.user_data = user_data;
-    node.builtin_data = reinterpret_cast<void*>(builtin_data);
-    node.custom_initial_data = custom_data;
-    node.custom_initial_data_size = custom_data_size;
-    node.delegate = nullptr;
-    if (registration->prepare) {
-      TfLiteStatus prepare_status = registration->prepare(&context_, &node);
-      if (prepare_status != kTfLiteOk) {
-        error_reporter_->Report(
-            "Node %s (number %d) failed to prepare with status %d",
-            OpNameFromRegistration(registration), i, prepare_status);
-        return kTfLiteError;
-      }
-    }
-
-    if (registration->invoke) {
-      TfLiteStatus invoke_status = registration->invoke(&context_, &node);
-      if (invoke_status != kTfLiteOk) {
-        error_reporter_->Report(
-            "Node %s (number %d) failed to invoke with status %d",
-            OpNameFromRegistration(registration), i, invoke_status);
-        return kTfLiteError;
-      }
-    }
-
-    if (registration->free) {
-      registration->free(&context_, user_data);
-    }
-  }
+  } while (!done);
   return status;
 }
 

@@ -53,6 +53,16 @@ class MicroInterpreter {
   // registerPreallocatedInput.
   TfLiteStatus AllocateTensors();
 
+  // Initialize inference state for next inference
+  TfLiteStatus InvokeStart();
+
+  // Iteratively advance inference
+  TfLiteStatus InvokeStep(bool& done);
+
+  // Abort current inference
+  TfLiteStatus InvokeAbort();
+
+  // Monolithic inference
   TfLiteStatus Invoke();
 
   size_t tensors_size() const { return context_.tensors_size; }
@@ -86,6 +96,14 @@ class MicroInterpreter {
   const flatbuffers::Vector<flatbuffers::Offset<Operator>>* operators_;
 
   const SubGraph* subgraph_;
+
+  struct InvokeContext {
+    InvokeContext() : state(IDLE) {};
+    enum InvokeState { IDLE, STARTED } state;
+    size_t current_opcode;
+  };
+
+  InvokeContext invokeContext_;
 };
 
 }  // namespace tflite
