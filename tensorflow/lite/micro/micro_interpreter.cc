@@ -148,9 +148,14 @@ TfLiteStatus MicroInterpreter::AllocateTensors() {
   return kTfLiteOk;
 }
 
-TfLiteStatus MicroInterpreter::Invoke() {
+TfLiteStatus MicroInterpreter::InvokeStart() {
+  if (invokeContext_.state != InvokeContext::IDLE) {
+    error_reporter_->Report("InvokeStart() called and MicroInterpreter not idle \n");
+    return kTfLiteError;
+  }
+
   if (initialization_status_ != kTfLiteOk) {
-    error_reporter_->Report("Invoke() called after initialization failed\n");
+    error_reporter_->Report("InvokeStart() called after initialization failed\n");
     return kTfLiteError;
   }
 
@@ -188,25 +193,58 @@ TfLiteStatus MicroInterpreter::Invoke() {
         error_reporter_->Report(
             "Node %s (number %d) failed to prepare with status %d",
             OpNameFromRegistration(registration), i, prepare_status);
+	InvokeFinish();
         return kTfLiteError;
       }
     }
   }
 
-  for (size_t i = 0; i < operators_->size(); ++i) {
-    auto* node = &(node_and_registrations_[i].node);
-    auto* registration = node_and_registrations_[i].registration;
+  invokeContext_.state = InvokeContext::STARTED;
+  invokeContext_.current_opcode = 0;
+  return kTfLiteOk;
+}
 
-    if (registration->invoke) {
-      TfLiteStatus invoke_status = registration->invoke(&context_, node);
-      if (invoke_status != kTfLiteOk) {
-        error_reporter_->Report(
-            "Node %s (number %d) failed to invoke with status %d",
-            OpNameFromRegistration(registration), i, invoke_status);
-        return kTfLiteError;
-      }
+TfLiteStatus MicroInterpreter::InvokeStep(bool &done) {
+
+  if (invokeContext_.state != InvokeContext::STARTED) {
+    error_reporter_->Report("InvokeStep() called and MicroInterpreter is idle\n");
+    return kTfLiteError;
+  }
+
+  int i = invokeContext_.current_opcode++;
+  auto* node = &(node_and_registrations_[i].node);
+  auto* registration = node_and_registrations_[i].registration;
+  
+  if (registration->invoke) {
+    TfLiteStatus invoke_status = registration->invoke(&context_, node);
+    if (invoke_status != kTfLiteOk) {
+      error_reporter_->Report(
+			      "Node %s (number %d) failed to invoke with status %d",
+			      OpNameFromRegistration(registration), i, invoke_status);
+      InvokeFinish();
+      return kTfLiteError;
     }
   }
+
+  done = (invokeContext_.current_opcode ==  operators_->size());
+
+  if (done) {
+    InvokeFinish();
+  }
+
+  return kTfLiteOk;
+}
+
+TfLiteStatus MicroInterpreter::InvokeAbort() {
+  if (invokeContext_.state != InvokeContext::STARTED) {
+    error_reporter_->Report("InvokeAbort() called and MicroInterpreter is idle\n");
+    return kTfLiteError;
+  }
+  InvokeFinish();
+  return kTfLiteOk;
+}
+
+void MicroInterpreter::InvokeFinish() {
 
   // This is actually a no-op.
   // TODO(wangtz): Consider removing this code to slightly reduce binary size.
@@ -217,7 +255,23 @@ TfLiteStatus MicroInterpreter::Invoke() {
       registration->free(&context_, node->user_data);
     }
   }
-  return kTfLiteOk;
+  invokeContext_.state = InvokeContext::IDLE;
+}
+
+
+TfLiteStatus  MicroInterpreter::Invoke() {
+  TfLiteStatus status = InvokeStart();
+  if (status != kTfLiteOk) {
+    return status;
+  }
+  bool done;
+  do {
+    status = InvokeStep(done);
+    if (status != kTfLiteOk) {
+      return status;
+    }
+  } while (!done);
+  return status;
 }
 
 TfLiteTensor* MicroInterpreter::input(size_t index) {
